@@ -1,25 +1,43 @@
 import AppKit
 import CryptoKit
+import ServiceManagement
 import SwiftUI
 
+let defaults = UserDefaults.standard
+let commandCodeAuth = NSString(string: "~/.commandcode/auth.json").expandingTildeInPath
+
+// Settings: claudeDirs = Claude Code config dirs, one per line; commandCode / allScreens toggles.
+func registerDefaults() {
+    defaults.register(defaults: [
+        "claudeDirs": "~/.claude",
+        "commandCode": FileManager.default.fileExists(atPath: commandCodeAuth),
+        "allScreens": true,
+    ])
+}
+
+typealias Account = (name: String, fetch: () async throws -> Usage)
+
 // Cards shown in the island, left to right.
-let accounts: [(name: String, fetch: () async throws -> Usage)] = [
-    ("claude", { try await fetchUsage(keychainService("~/.claude")) }),
-    ("claude2", { try await fetchUsage(keychainService("~/.claude2")) }),
-    ("command code", fetchCommandCode),
-]
+func accounts() -> [Account] {
+    let dirs = (defaults.string(forKey: "claudeDirs") ?? "").split(whereSeparator: \.isNewline)
+        .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    var list: [Account] = dirs.map { dir in
+        ((dir as NSString).lastPathComponent.trimmingCharacters(in: ["."]), { try await fetchUsage(keychainService(dir)) })
+    }
+    if defaults.bool(forKey: "commandCode") { list.append(("command code", fetchCommandCode)) }
+    return list
+}
 
 // ~/.claude uses the plain keychain item; other config dirs add a sha256(path) prefix.
-
 func keychainService(_ dir: String) -> String {
     let path = NSString(string: dir).expandingTildeInPath
-    if dir == "~/.claude" { return "Claude Code-credentials" }
+    if path == NSString(string: "~/.claude").expandingTildeInPath { return "Claude Code-credentials" }
     let hash = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
     return "Claude Code-credentials-" + hash.prefix(8)
 }
 
-struct Limit: Decodable { let utilization: Double; let resets_at: String? }
-struct Usage: Decodable { let five_hour: Limit; let seven_day: Limit }
+struct Limit: Codable { let utilization: Double; let resets_at: String? }
+struct Usage: Codable { let five_hour: Limit; let seven_day: Limit }
 struct Err: Error, CustomStringConvertible { let description: String }
 
 func token(_ service: String) throws -> String {
@@ -43,6 +61,7 @@ func fetchUsage(_ service: String) async throws -> Usage {
     let (data, resp) = try await URLSession.shared.data(for: req)
     let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
     if code == 401 { throw Err(description: "token 过期，打开一次 Claude Code") }
+    if code == 429 { throw Err(description: "请求太频繁，稍后自动重试") }
     guard code == 200 else { throw Err(description: "HTTP \(code)") }
     return try JSONDecoder().decode(Usage.self, from: data)
 }
@@ -52,7 +71,7 @@ func fetchCommandCode() async throws -> Usage {
     struct Auth: Decodable { let apiKey: String }
     struct W: Decodable { let used: Double; let cap: Double; let resetAt: Double }
     struct R: Decodable { struct L: Decodable { let fiveHour: W; let weekly: W }; let windowLimits: L }
-    guard let data = FileManager.default.contents(atPath: NSString(string: "~/.commandcode/auth.json").expandingTildeInPath),
+    guard let data = FileManager.default.contents(atPath: commandCodeAuth),
           let auth = try? JSONDecoder().decode(Auth.self, from: data)
     else { throw Err(description: "未登录，运行 commandcode login") }
     var req = URLRequest(url: URL(string: "https://api.commandcode.ai/alpha/billing/credits")!)
@@ -79,17 +98,22 @@ func resetText(_ s: String?) -> String {
 }
 
 @MainActor final class Model: ObservableObject {
-    @Published var usage: [String: Usage] = [:]
+    // last good result per account survives restarts, so a 429 on launch doesn't leave a card empty
+    @Published var usage: [String: Usage] = (defaults.data(forKey: "cache").flatMap { try? JSONDecoder().decode([String: Usage].self, from: $0) }) ?? [:]
     @Published var error: [String: String] = [:]
-    @Published var expanded = false
+    @Published var names: [String] = accounts().map(\.name)
+    @Published var expanded: Int? // index of the screen whose island is open
     private var last = Date.distantPast
 
     func refresh(force: Bool = false) async {
-        guard force || Date().timeIntervalSince(last) > 15 else { return }
+        guard force || Date().timeIntervalSince(last) > 60 else { return }
         last = Date()
-        for a in accounts {
+        let list = accounts()
+        names = list.map(\.name)
+        for a in list {
             do { usage[a.name] = try await a.fetch(); error[a.name] = nil } catch { self.error[a.name] = "\(error)" }
         }
+        defaults.set(try? JSONEncoder().encode(usage), forKey: "cache")
     }
 }
 
@@ -98,23 +122,32 @@ let cardWidth: CGFloat = 200
 struct IslandView: View {
     @ObservedObject var m: Model
     let notch: CGSize
+    let index: Int
+    var open: Bool { m.expanded == index }
 
     var body: some View {
         VStack(spacing: 0) {
-            if m.expanded {
-                Spacer().frame(height: notch.height + 4)
+            if open {
+                HStack {
+                    Spacer()
+                    Button { (NSApp.delegate as? Delegate)?.openSettings() } label: {
+                        Image(systemName: "gearshape.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .frame(height: notch.height + 4)
                 HStack(spacing: 10) {
-                    ForEach(accounts, id: \.name) { card($0.name) }
+                    ForEach(m.names, id: \.self) { card($0) }
                 }
                 .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
             }
         }
         .foregroundStyle(.white)
-        .padding([.horizontal, .bottom], m.expanded ? 12 : 0)
-        .frame(width: m.expanded ? nil : notch.width, height: m.expanded ? nil : notch.height, alignment: .top)
-        .background(.black, in: UnevenRoundedRectangle(bottomLeadingRadius: m.expanded ? 28 : 10, bottomTrailingRadius: m.expanded ? 28 : 10))
+        .padding([.horizontal, .bottom], open ? 12 : 0)
+        .frame(width: open ? nil : notch.width, height: open ? nil : notch.height, alignment: .top)
+        .background(.black, in: UnevenRoundedRectangle(bottomLeadingRadius: open ? 28 : 10, bottomTrailingRadius: open ? 28 : 10))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(.spring(duration: 0.35, bounce: 0.25), value: m.expanded)
+        .animation(.spring(duration: 0.35, bounce: 0.25), value: open)
         .environment(\.colorScheme, .dark)
     }
 
@@ -163,51 +196,133 @@ struct IslandView: View {
 
 extension Color { static let claude = Color(red: 0.85, green: 0.47, blue: 0.34) } // #D97757
 
-@MainActor final class Delegate: NSObject, NSApplicationDelegate {
-    let m = Model()
-    var panel: NSPanel!
+// not @State: it's a macro in this SDK, and plain swiftc (no Xcode) lacks the macro plugin
+final class LoginItem: ObservableObject { @Published var status = SMAppService.mainApp.status }
 
-    func applicationDidFinishLaunching(_ n: Notification) {
-        let s = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
-        let f = s.frame
-        var notch = CGSize(width: 200, height: 32) // no-notch fallback
-        if let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea, s.safeAreaInsets.top > 0 {
-            notch = CGSize(width: f.width - l.width - r.width, height: s.safeAreaInsets.top)
-        }
-        let size = CGSize(width: (cardWidth + 10) * CGFloat(accounts.count) + 40, height: 220)
-        panel = NSPanel(contentRect: CGRect(x: f.midX - size.width / 2, y: f.maxY - size.height, width: size.width, height: size.height),
-                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = false
-        panel.level = NSWindow.Level(Int(CGWindowLevelForKey(.mainMenuWindow)) + 3)
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        panel.ignoresMouseEvents = true // hover is detected by polling below, so clicks always pass through
-        panel.contentView = NSHostingView(rootView: IslandView(m: m, notch: notch))
-        panel.orderFrontRegardless()
+struct SettingsView: View {
+    @AppStorage("claudeDirs") var claudeDirs = "~/.claude"
+    @AppStorage("commandCode") var commandCode = false
+    @AppStorage("allScreens") var allScreens = true
+    @StateObject var login = LoginItem()
 
-        let notchRect = CGRect(x: f.midX - notch.width / 2, y: f.maxY - notch.height, width: notch.width, height: notch.height + 2)
-        // ponytail: 10Hz mouse polling, no permissions needed; switch to a tracking area if CPU ever shows up
-        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [m, panel] _ in
-            MainActor.assumeIsolated {
-                let p = NSEvent.mouseLocation
-                let inside = m.expanded ? panel!.frame.contains(p) : notchRect.contains(p)
-                if inside != m.expanded {
-                    m.expanded = inside
-                    if inside { Task { await m.refresh() } }
-                }
+    var body: some View {
+        Form {
+            Section {
+                TextEditor(text: $claudeDirs).font(.system(.body, design: .monospaced)).frame(height: 64)
+            } header: {
+                Text("Claude Code 配置目录（每行一个）")
+            } footer: {
+                Text("默认 ~/.claude；用 CLAUDE_CONFIG_DIR 登录的其他账号填对应目录").foregroundStyle(.secondary)
+            }
+            Toggle("显示 Command Code", isOn: $commandCode)
+            Toggle("在所有显示器上显示", isOn: $allScreens)
+            Toggle("开机自启", isOn: Binding(get: { login.status == .enabled }, set: { on in
+                try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+                login.status = SMAppService.mainApp.status
+            }))
+            if login.status == .requiresApproval { Text("请到 系统设置 › 通用 › 登录项 中允许").foregroundStyle(.orange) }
+            HStack {
+                Text("关闭窗口后生效").foregroundStyle(.secondary)
+                Spacer()
+                Button("退出 Claude Usage Island") { NSApp.terminate(nil) }
             }
         }
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [m] _ in
+        .formStyle(.grouped)
+        .frame(width: 440, height: 380) // grouped Form scrolls, so it has no intrinsic height
+    }
+}
+
+@MainActor final class Delegate: NSObject, NSApplicationDelegate {
+    let m = Model()
+    var slots: [(panel: NSPanel, trigger: CGRect)] = []
+    var settings: NSWindow?
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        buildPanels()
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { self.buildPanels() }
+        }
+        // ponytail: 10Hz mouse polling, no permissions needed; switch to a tracking area if CPU ever shows up
+        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            MainActor.assumeIsolated { self.trackMouse() }
+        }
+        Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [m] _ in
             MainActor.assumeIsolated { _ = Task { await m.refresh(force: true) } }
         }
         Task { await m.refresh(force: true) }
+    }
+
+    // Double-clicking the app again opens settings.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        openSettings()
+        return false
+    }
+
+    // One island per screen (or just the notch screen), rebuilt when screens or settings change.
+    func buildPanels() {
+        slots.forEach { $0.panel.close() }
+        m.expanded = nil
+        let notched = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
+        let screens = defaults.bool(forKey: "allScreens") ? NSScreen.screens : [notched]
+        let size = CGSize(width: (cardWidth + 10) * CGFloat(max(accounts().count, 1)) + 40, height: 220)
+        slots = screens.enumerated().map { i, s in
+            let f = s.frame
+            // no notch: a pill the height of the menu bar in its center
+            var notch = CGSize(width: 200, height: max(f.maxY - s.visibleFrame.maxY, 24))
+            if let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea, s.safeAreaInsets.top > 0 {
+                notch = CGSize(width: f.width - l.width - r.width, height: s.safeAreaInsets.top)
+            }
+            let panel = NSPanel(contentRect: CGRect(x: f.midX - size.width / 2, y: f.maxY - size.height, width: size.width, height: size.height),
+                                styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.isReleasedWhenClosed = false
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.hasShadow = false
+            panel.level = NSWindow.Level(Int(CGWindowLevelForKey(.mainMenuWindow)) + 3)
+            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            panel.ignoresMouseEvents = true // clicks pass through until the island is open
+            panel.contentView = NSHostingView(rootView: IslandView(m: m, notch: notch, index: i))
+            panel.orderFrontRegardless()
+            return (panel, CGRect(x: f.midX - notch.width / 2, y: f.maxY - notch.height, width: notch.width, height: notch.height + 2))
+        }
+    }
+
+    func trackMouse() {
+        let p = NSEvent.mouseLocation
+        let hit = slots.indices.first { (m.expanded == $0 ? slots[$0].panel.frame : slots[$0].trigger).contains(p) }
+        guard hit != m.expanded else { return }
+        if let e = m.expanded { slots[e].panel.ignoresMouseEvents = true }
+        m.expanded = hit
+        if let hit {
+            slots[hit].panel.ignoresMouseEvents = false // so the gear button is clickable
+            Task { await m.refresh() }
+        }
+    }
+
+    func openSettings() {
+        if settings == nil {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView()))
+            w.title = "Claude Usage Island"
+            w.isReleasedWhenClosed = false
+            w.center()
+            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
+                MainActor.assumeIsolated {
+                    self.buildPanels()
+                    Task { await self.m.refresh(force: true) }
+                }
+            }
+            settings = w
+        }
+        NSApp.activate()
+        settings?.makeKeyAndOrderFront(nil)
+        settings?.orderFrontRegardless() // activate() is cooperative since macOS 14 and may leave it behind
     }
 }
 
 @main @MainActor enum Island {
     static let delegate = Delegate()
     static func main() {
+        registerDefaults()
         NSApplication.shared.delegate = delegate
         NSApplication.shared.setActivationPolicy(.accessory)
         NSApplication.shared.run()
