@@ -22,7 +22,10 @@ func accounts() -> [Account] {
     let dirs = (defaults.string(forKey: "claudeDirs") ?? "").split(whereSeparator: \.isNewline)
         .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     var list: [Account] = dirs.map { dir in
-        ((dir as NSString).lastPathComponent.trimmingCharacters(in: ["."]), { try await fetchUsage(keychainService(dir)) })
+        ((dir as NSString).lastPathComponent.trimmingCharacters(in: ["."]), {
+            guard FileManager.default.fileExists(atPath: NSString(string: dir).expandingTildeInPath) else { throw Err(description: "目录不存在：\(dir)") }
+            return try await fetchUsage(dir)
+        })
     }
     if defaults.bool(forKey: "commandCode") { list.append(("command code", fetchCommandCode)) }
     return list
@@ -40,7 +43,10 @@ struct Limit: Codable { let utilization: Double; let resets_at: String? }
 struct Usage: Codable { let five_hour: Limit; let seven_day: Limit }
 struct Err: Error, CustomStringConvertible { let description: String }
 
-func token(_ service: String) throws -> String {
+// Only the claude CLI renews the keychain token (~8h life), and an expired token gets a 429 rather than a 401,
+// so check expiresAt first instead of misreporting it as rate limiting.
+func token(_ dir: String) throws -> String {
+    let service = keychainService(dir)
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
     p.arguments = ["find-generic-password", "-s", service, "-w"]
@@ -49,14 +55,18 @@ func token(_ service: String) throws -> String {
     try p.run()
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    struct Creds: Decodable { struct O: Decodable { let accessToken: String }; let claudeAiOauth: O }
+    struct Creds: Decodable { struct O: Decodable { let accessToken: String; let expiresAt: Double? }; let claudeAiOauth: O }
     guard let c = try? JSONDecoder().decode(Creds.self, from: data) else { throw Err(description: "Keychain 里找不到 Claude Code 登录信息") }
+    if let exp = c.claudeAiOauth.expiresAt, exp / 1000 < Date().timeIntervalSince1970 {
+        let cmd = service == "Claude Code-credentials" ? "claude" : "CLAUDE_CONFIG_DIR=\(dir) claude"
+        throw Err(description: "token 过期，运行一次 \(cmd)")
+    }
     return c.claudeAiOauth.accessToken
 }
 
-func fetchUsage(_ service: String) async throws -> Usage {
+func fetchUsage(_ dir: String) async throws -> Usage {
     var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-    req.setValue("Bearer \(try token(service))", forHTTPHeaderField: "Authorization")
+    req.setValue("Bearer \(try token(dir))", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     let (data, resp) = try await URLSession.shared.data(for: req)
     let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -103,15 +113,23 @@ func resetText(_ s: String?) -> String {
     @Published var error: [String: String] = [:]
     @Published var names: [String] = accounts().map(\.name)
     @Published var expanded: Int? // index of the screen whose island is open
+    @Published var loading = false
     private var last = Date.distantPast
 
     func refresh(force: Bool = false) async {
-        guard force || Date().timeIntervalSince(last) > 60 else { return }
+        guard !loading, force || Date().timeIntervalSince(last) > 60 else { return }
         last = Date()
+        loading = true
+        defer { loading = false }
         let list = accounts()
         names = list.map(\.name)
-        for a in list {
-            do { usage[a.name] = try await a.fetch(); error[a.name] = nil } catch { self.error[a.name] = "\(error)" }
+        // all accounts in parallel; plain Tasks because withTaskGroup segfaults under -O with Swift 6.4
+        let tasks = list.map { a in (a.name, Task { try await a.fetch() }) }
+        for (name, t) in tasks {
+            switch await t.result {
+            case .success(let u): usage[name] = u; error[name] = nil
+            case .failure(let e): error[name] = "\(e)"
+            }
         }
         defaults.set(try? JSONEncoder().encode(usage), forKey: "cache")
     }
@@ -130,6 +148,13 @@ struct IslandView: View {
             if open {
                 HStack {
                     Spacer()
+                    Button { Task { await m.refresh(force: true) } } label: {
+                        Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(m.loading ? 360 : 0))
+                            .animation(m.loading ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: m.loading)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(m.loading)
                     Button { (NSApp.delegate as? Delegate)?.openSettings() } label: {
                         Image(systemName: "gearshape.fill").foregroundStyle(.secondary)
                     }
@@ -167,7 +192,7 @@ struct IslandView: View {
                     .frame(maxWidth: .infinity, minHeight: 92)
             }
             if let e = m.error[dir], m.usage[dir] != nil {
-                Text(e).font(.system(size: 10)).foregroundStyle(.orange).lineLimit(1)
+                Text(e).font(.system(size: 10)).foregroundStyle(.orange).lineLimit(2)
             }
         }
         .padding(12)
