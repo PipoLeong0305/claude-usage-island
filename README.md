@@ -4,6 +4,8 @@
 
 Hover the MacBook notch to see your Claude Code 5-hour and weekly usage limits. Single Swift file, no dependencies.
 
+每张卡片的名字旁有 logo 和用量百分比（取 5 小时与每周中较高的），环形图和百分比按用量变色：< 50% 绿、< 80% 黄、< 95% 橙、其余红。
+
 ## 安装
 
 需要 macOS 14+ 和 Swift 工具链（Xcode 或 Command Line Tools）。
