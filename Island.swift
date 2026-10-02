@@ -5,12 +5,14 @@ import SwiftUI
 
 let defaults = UserDefaults.standard
 let commandCodeAuth = NSString(string: "~/.commandcode/auth.json").expandingTildeInPath
+let codexAuth = NSString(string: "~/.codex/auth.json").expandingTildeInPath
 
 // Settings: claudeDirs = Claude Code config dirs, one per line; commandCode / allScreens toggles.
 func registerDefaults() {
     defaults.register(defaults: [
         "claudeDirs": "~/.claude",
         "commandCode": FileManager.default.fileExists(atPath: commandCodeAuth),
+        "codex": FileManager.default.fileExists(atPath: codexAuth),
         "allScreens": true,
     ])
 }
@@ -28,6 +30,7 @@ func accounts() -> [Account] {
         })
     }
     if defaults.bool(forKey: "commandCode") { list.append(("command code", fetchCommandCode)) }
+    if defaults.bool(forKey: "codex") { list.append(("codex", fetchCodex)) }
     return list
 }
 
@@ -96,6 +99,28 @@ func fetchCommandCode() async throws -> Usage {
               resets_at: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: w.resetAt / 1000)))
     }
     return Usage(five_hour: limit(l.fiveHour), seven_day: limit(l.weekly))
+}
+
+// Codex (ChatGPT login): the CLI keeps the access token fresh, so a 401 means it needs a run.
+func fetchCodex() async throws -> Usage {
+    struct Auth: Decodable { struct T: Decodable { let access_token: String; let account_id: String? }; let tokens: T }
+    struct W: Decodable { let used_percent: Double; let reset_at: Double }
+    struct R: Decodable { struct L: Decodable { let primary_window: W; let secondary_window: W }; let rate_limit: L }
+    guard let data = FileManager.default.contents(atPath: codexAuth),
+          let auth = try? JSONDecoder().decode(Auth.self, from: data)
+    else { throw Err(description: "未登录，运行 codex login") }
+    var req = URLRequest(url: URL(string: "https://chatgpt.com/backend-api/wham/usage")!)
+    req.setValue("Bearer \(auth.tokens.access_token)", forHTTPHeaderField: "Authorization")
+    if let id = auth.tokens.account_id { req.setValue(id, forHTTPHeaderField: "ChatGPT-Account-Id") }
+    let (body, resp) = try await URLSession.shared.data(for: req)
+    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+    if code == 401 { throw Err(description: "token 过期，运行一次 codex") }
+    guard code == 200 else { throw Err(description: "HTTP \(code)") }
+    let l = try JSONDecoder().decode(R.self, from: body).rate_limit
+    func limit(_ w: W) -> Limit {
+        Limit(utilization: w.used_percent, resets_at: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: w.reset_at)))
+    }
+    return Usage(five_hour: limit(l.primary_window), seven_day: limit(l.secondary_window))
 }
 
 // "2026-09-27T21:49:59.542997+00:00" → "2h13m"; ISO8601DateFormatter chokes on 6-digit fractions, so drop them.
@@ -178,9 +203,15 @@ struct IslandView: View {
 
     func card(_ dir: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
+            let peak = m.usage[dir].map { max($0.five_hour.utilization, $0.seven_day.utilization) }
             HStack(spacing: 6) {
-                Circle().fill(m.error[dir] == nil ? Color.claude : .orange).frame(width: 6, height: 6)
+                logo(dir).frame(width: 14, height: 14)
                 Text(dir).font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 0)
+                if let peak {
+                    Text("\(Int(peak))%").font(.system(size: 12, weight: .semibold, design: .rounded)).monospacedDigit()
+                        .foregroundStyle(m.error[dir] == nil ? level(peak) : .orange)
+                }
             }
             if let u = m.usage[dir] {
                 HStack(spacing: 0) {
@@ -200,9 +231,29 @@ struct IslandView: View {
         .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
+    // Logos are drawn (no image assets in a single-file build): Claude's spark, OpenAI's blossom, an SF Symbol for Command Code.
+    @ViewBuilder func logo(_ name: String) -> some View {
+        if name.hasPrefix("command") {
+            Image(systemName: "command").resizable().scaledToFit().foregroundStyle(.white)
+        } else if name == "codex" {
+            // OpenAI-style blossom: six interlocking loops
+            ZStack {
+                ForEach(0..<6) { i in
+                    Capsule().stroke(.white, lineWidth: 1.3).frame(width: 5, height: 9).offset(y: -3.2).rotationEffect(.degrees(Double(i) * 60))
+                }
+            }
+        } else {
+            ZStack {
+                ForEach(0..<8) { i in
+                    Capsule().fill(Color.claude).frame(width: 2.4, height: 6.5).offset(y: -3.5).rotationEffect(.degrees(Double(i) * 45))
+                }
+            }
+        }
+    }
+
     func gauge(_ title: String, _ l: Limit) -> some View {
         let v = min(l.utilization, 100) / 100
-        let color: Color = l.utilization > 95 ? .red : l.utilization > 80 ? .orange : .claude
+        let color = level(l.utilization)
         return VStack(spacing: 5) {
             ZStack {
                 Circle().stroke(.white.opacity(0.1), lineWidth: 5)
@@ -221,12 +272,18 @@ struct IslandView: View {
 
 extension Color { static let claude = Color(red: 0.85, green: 0.47, blue: 0.34) } // #D97757
 
+// green < 50, yellow < 80, orange < 95, red above
+func level(_ pct: Double) -> Color {
+    pct < 50 ? .green : pct < 80 ? .yellow : pct < 95 ? .orange : .red
+}
+
 // not @State: it's a macro in this SDK, and plain swiftc (no Xcode) lacks the macro plugin
 final class LoginItem: ObservableObject { @Published var status = SMAppService.mainApp.status }
 
 struct SettingsView: View {
     @AppStorage("claudeDirs") var claudeDirs = "~/.claude"
     @AppStorage("commandCode") var commandCode = false
+    @AppStorage("codex") var codex = false
     @AppStorage("allScreens") var allScreens = true
     @StateObject var login = LoginItem()
 
@@ -240,6 +297,7 @@ struct SettingsView: View {
                 Text("默认 ~/.claude；用 CLAUDE_CONFIG_DIR 登录的其他账号填对应目录").foregroundStyle(.secondary)
             }
             Toggle("显示 Command Code", isOn: $commandCode)
+            Toggle("显示 Codex", isOn: $codex)
             Toggle("在所有显示器上显示", isOn: $allScreens)
             Toggle("开机自启", isOn: Binding(get: { login.status == .enabled }, set: { on in
                 try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
@@ -253,7 +311,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 380) // grouped Form scrolls, so it has no intrinsic height
+        .frame(width: 440, height: 410) // grouped Form scrolls, so it has no intrinsic height
     }
 }
 
